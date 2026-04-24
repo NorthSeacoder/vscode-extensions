@@ -7,9 +7,11 @@ import type { Config, Source } from '../types'
 import logger from '../utils/logger'
 import { formatSize } from '../utils'
 import { readdir } from 'fs/promises'
-import { mkdir, stat, unlink } from 'fs/promises'
+import { mkdir, stat, unlink, rename } from 'fs/promises'
 import * as tar from 'tar'
 import { tmpdir } from 'os'
+import checkDiskSpace from 'check-disk-space'
+
 
 export class BackupService {
   private readonly config: Config
@@ -24,6 +26,27 @@ export class BackupService {
 
     try {
       const stats = await stat(source.path)
+      const tempDir = this.config.backup.tempDir || path.dirname(source.path)
+      
+      // 检查源文件目录空间
+      const sourceDirSpace = await this.getAvailableDiskSpace(path.dirname(source.path))
+      // 检查临时目录空间
+      const tempDirSpace = await this.getAvailableDiskSpace(tempDir)
+      // 检查目标目录空间
+      const destDirSpace = await this.getAvailableDiskSpace(this.config.backup.dir)
+
+      // 所需空间估算（源文件大小 + 临时文件 + 最终文件）
+      const requiredSpace = stats.size * 2.1
+
+      if (tempDirSpace < requiredSpace) {
+        throw new Error(`临时目录空间不足。需要 ${formatSize(requiredSpace)}，但只有 ${formatSize(tempDirSpace)} 可用空间`)
+      }
+
+      // 清理临时文件
+      if (this.config.backup.cleanupTemp) {
+        await this.cleanupTempFiles(tempDir)
+      }
+
       let sourceFilePath = source.path
 
       // 如果是目录，先创建临时 tar 文件
@@ -80,83 +103,109 @@ export class BackupService {
   private async encryptFile(sourcePath: string, destPath: string, totalSize: number): Promise<void> {
     return new Promise(async (resolve, reject) => {
       try {
-        // 生成加密所需的密钥和 IV
-        const password = this.config.encryption.key
-        if (!password) {
-          throw new Error('未配置加密密钥')
-        }
+        // 获取目标文件所在目录作为临时文件目录
+        const tempDir = path.dirname(destPath)
+        
+        // 创建临时文件路径
+        const tempFilePath = path.join(tempDir, `temp-${Date.now()}-${randomBytes(4).toString('hex')}`)
+        
+        // 设置 Node.js 临时文件目录
+        process.env.TMPDIR = tempDir // Unix
+        process.env.TEMP = tempDir   // Windows
+        process.env.TMP = tempDir    // Windows
 
-        const salt = randomBytes(32)
-        const iv = randomBytes(16)
-        const key = (await promisify(scrypt)(password, salt, 32)) as Buffer
+        const input = createReadStream(sourcePath, {
+          highWaterMark: 16 * 1024 * 1024
+        })
+        
+        // 使用指定目录的临时文件
+        const output = createWriteStream(tempFilePath, {
+          highWaterMark: 16 * 1024 * 1024
+        })
 
-        // 创建加密器
-        const cipher = createCipheriv('aes-256-gcm', key, iv)
-
-        // 创建读写流
-        const input = createReadStream(sourcePath)
-        const output = createWriteStream(destPath)
-
-        // 写入加密元数据
-        const header = Buffer.concat([
-          Buffer.from([1]), // 版本号
-          salt, // 32 字节
-          iv, // 16 字节
-        ])
-        output.write(header)
-
-        // 进度追踪
-        let processedBytes = 0
-        let lastBytes = 0
-        let lastTime = Date.now()
-
-        input.on('data', (chunk) => {
-          processedBytes += chunk.length
-
-          const now = Date.now()
-          const timeDiff = (now - lastTime) / 1000
-          if (timeDiff >= 0.5) {
-            // 每500ms更新一次进度
-            const bytesDiff = processedBytes - lastBytes
-            const speed = Math.floor(bytesDiff / timeDiff)
-            const percent = (processedBytes / totalSize) * 100
-
-            this.updateProgressBar(percent, speed, '加密中')
-
-            lastBytes = processedBytes
-            lastTime = now
+        try {
+          // 生成加密所需的密钥和 IV
+          const password = this.config.encryption.key
+          if (!password) {
+            throw new Error('未配置加密密钥')
           }
-        })
 
-        // 错误处理
-        const cleanup = () => {
-          input.removeAllListeners()
-          output.removeAllListeners()
-          cipher.removeAllListeners()
+          const salt = randomBytes(32)
+          const iv = randomBytes(16)
+          const key = (await promisify(scrypt)(password, salt, 32)) as Buffer
+
+          // 创建加密器
+          const cipher = createCipheriv('aes-256-gcm', key, iv)
+
+          // 写入加密元数据
+          const header = Buffer.concat([
+            Buffer.from([1]), // 版本号
+            salt, // 32 字节
+            iv, // 16 字节
+          ])
+          output.write(header)
+
+          // 进度追踪
+          let processedBytes = 0
+          let lastBytes = 0
+          let lastTime = Date.now()
+
+          input.on('data', (chunk) => {
+            processedBytes += chunk.length
+
+            const now = Date.now()
+            const timeDiff = (now - lastTime) / 1000
+            if (timeDiff >= 0.5) {
+              // 每500ms更新一次进度
+              const bytesDiff = processedBytes - lastBytes
+              const speed = Math.floor(bytesDiff / timeDiff)
+              const percent = (processedBytes / totalSize) * 100
+
+              this.updateProgressBar(percent, speed, '加密中')
+
+              lastBytes = processedBytes
+              lastTime = now
+            }
+          })
+
+          // 错误处理
+          const cleanup = () => {
+            input.removeAllListeners()
+            output.removeAllListeners()
+            cipher.removeAllListeners()
+          }
+
+          input.on('error', (err) => {
+            cleanup()
+            reject(err)
+          })
+
+          output.on('error', (err) => {
+            cleanup()
+            reject(err)
+          })
+
+          // 完成处理
+          output.on('finish', () => {
+            cleanup()
+            this.updateProgressBar(100, 0, '加密完成')
+            resolve()
+          })
+
+          // 执行加密流程
+          await pipeline(input, cipher, output)
+
+          // 写入认证标签
+          output.write(cipher.getAuthTag())
+
+          // 成功后，将临时文件重命名为目标文件
+          await rename(tempFilePath, destPath)
+        } catch (error) {
+          // 清理临时文件
+          await unlink(tempFilePath).catch(() => {})
+          throw error
         }
 
-        input.on('error', (err) => {
-          cleanup()
-          reject(err)
-        })
-
-        output.on('error', (err) => {
-          cleanup()
-          reject(err)
-        })
-
-        // 完成处理
-        output.on('finish', () => {
-          cleanup()
-          this.updateProgressBar(100, 0, '加密完成')
-          resolve()
-        })
-
-        // 执行加密流程
-        await pipeline(input, cipher, output)
-
-        // 写入认证标签
-        output.write(cipher.getAuthTag())
       } catch (error) {
         reject(error)
       }
@@ -435,5 +484,47 @@ export class BackupService {
         reject(error);
       }
     });
+  }
+
+  // 添加临时文件清理函数
+  private async cleanupTempFiles(directory: string): Promise<void> {
+    try {
+      const files = await readdir(directory)
+      for (const file of files) {
+        if (file.startsWith('temp-')) {
+          const filePath = path.join(directory, file)
+          const stats = await stat(filePath)
+          
+          // 清理超过24小时的临时文件
+          if (Date.now() - stats.mtime.getTime() > 24 * 60 * 60 * 1000) {
+            await unlink(filePath)
+            logger.info('清理过期临时文件', { path: filePath })
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('清理临时文件失败', error as Error)
+    }
+  }
+
+  // 添加检查磁盘空间的方法
+  private async getAvailableDiskSpace(directory: string): Promise<number> {
+    try {
+      // Windows 路径需要特殊处理
+      const rootPath = process.platform === 'win32' 
+        ? directory.split(path.sep)[0] + path.sep  // 获取盘符，如 "C:\"
+        : directory
+
+      const diskSpace = await checkDiskSpace(rootPath)
+      return diskSpace.free  // 返回可用空间（字节）
+
+    } catch (error) {
+      logger.error('获取磁盘空间信息失败', {
+        directory,
+        error: error as Error,
+        platform: process.platform
+      })
+      throw error
+    }
   }
 }
